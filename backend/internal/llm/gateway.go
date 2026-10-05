@@ -13,16 +13,18 @@ import (
 
 	"github.com/chengpeng-cp/nexus-agent/internal/config"
 	"github.com/chengpeng-cp/nexus-agent/internal/observability"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Gateway 统一大模型网关。
 type Gateway struct {
-	mu          sync.RWMutex
-	providers   map[string]Provider
-	breakers    map[string]*CircuitBreaker // 按 provider code
-	semaphores  map[string]*Semaphore      // 按 provider code
-	retryCfg    RetryConfig
-	cfg         *config.LLM
+	mu         sync.RWMutex
+	providers  map[string]Provider
+	breakers   map[string]*CircuitBreaker // 按 provider code
+	semaphores map[string]*Semaphore      // 按 provider code
+	retryCfg   RetryConfig
+	cfg        *config.LLM
 }
 
 // NewGateway 构造。
@@ -93,17 +95,27 @@ func (g *Gateway) runWithGuard(ctx context.Context, desc *ModelDescriptor, fn fu
 // Chat 非流式对话（含失败转移）。
 // primary 失败且配置了 fallback 时自动切换，返回实际使用的描述符。
 func (g *Gateway) Chat(ctx context.Context, primary, fallback *ModelDescriptor, req *ChatRequest) (*ChatResponse, *ModelDescriptor, error) {
+	ctx, span := observability.StartSpan(ctx, "llm.chat", llmAttrs(primary)...)
+	defer span.End()
+
 	resp, used, err := g.chatOnce(ctx, primary, req)
 	if err == nil {
+		span.SetAttributes(usageAttrs(resp.Usage)...)
 		return resp, used, nil
 	}
+
+	// 失败转移：把降级过程写进 span，Jaeger 里一眼能看出这次走了 fallback
+	span.SetAttributes(attribute.String("llm.primary_error", err.Error()))
 	if fallback != nil && fallback.ProviderCode != primary.ProviderCode {
 		resp2, used2, err2 := g.chatOnce(ctx, fallback, req)
 		if err2 == nil {
+			span.SetAttributes(append(usageAttrs(resp2.Usage),
+				attribute.String("llm.fallback_model", fallback.ModelName))...)
 			return resp2, used2, nil
 		}
-		return nil, nil, fmt.Errorf("primary: %w; fallback: %w", err, err2)
+		err = fmt.Errorf("primary: %w; fallback: %w", err, err2)
 	}
+	observability.MarkError(span, err)
 	return nil, nil, err
 }
 
@@ -125,18 +137,47 @@ func (g *Gateway) chatOnce(ctx context.Context, desc *ModelDescriptor, req *Chat
 //
 // 失败转移策略：仅在"首事件到达前"失败时切换 fallback（流中失败无法重放）。
 func (g *Gateway) ChatStream(ctx context.Context, primary, fallback *ModelDescriptor, req *ChatRequest) (<-chan StreamEvent, *ModelDescriptor, error) {
+	// 流式调用的真实耗时在"消费阶段"，span 必须活到流关闭才结束。
+	// 所以 span 在这里创建，由 spanOnClose 的转发协程收尾
+	// （若放进 runWithGuard，拿到通道就返回，span 只有几毫秒，等于没测）。
+	ctx, span := observability.StartSpan(ctx, "llm.chat_stream", llmAttrs(primary)...)
+
 	events, err := g.streamOnce(ctx, primary, req)
 	if err == nil {
-		return events, primary, nil
+		return spanOnClose(events, span), primary, nil
 	}
+
+	span.SetAttributes(attribute.String("llm.primary_error", err.Error()))
 	if fallback != nil && fallback.ProviderCode != primary.ProviderCode {
 		events2, err2 := g.streamOnce(ctx, fallback, req)
 		if err2 == nil {
-			return events2, fallback, nil
+			span.SetAttributes(attribute.String("llm.fallback_model", fallback.ModelName))
+			return spanOnClose(events2, span), fallback, nil
 		}
-		return nil, nil, fmt.Errorf("primary: %w; fallback: %w", err, err2)
+		err = fmt.Errorf("primary: %w; fallback: %w", err, err2)
 	}
+	observability.MarkError(span, err)
+	span.End()
 	return nil, nil, err
+}
+
+// spanOnClose 把 span 的生命周期绑定到事件流：源通道关闭（流消费完）时结束 span。
+// 通道容量与源保持一致，不改变原有背压特性。
+func spanOnClose(src <-chan StreamEvent, span trace.Span) <-chan StreamEvent {
+	if !span.SpanContext().IsValid() {
+		// 追踪未启用（no-op span）：不额外起转发协程，零开销原样透传
+		span.End()
+		return src
+	}
+	out := make(chan StreamEvent, cap(src))
+	go func() {
+		defer close(out)
+		defer span.End()
+		for ev := range src {
+			out <- ev
+		}
+	}()
+	return out
 }
 
 func (g *Gateway) streamOnce(ctx context.Context, desc *ModelDescriptor, req *ChatRequest) (<-chan StreamEvent, error) {
@@ -154,23 +195,33 @@ func (g *Gateway) streamOnce(ctx context.Context, desc *ModelDescriptor, req *Ch
 
 // Embed 向量化。
 func (g *Gateway) Embed(ctx context.Context, desc *ModelDescriptor, texts []string) ([][]float32, error) {
+	ctx, span := observability.StartSpan(ctx, "llm.embed",
+		append(llmAttrs(desc), attribute.Int("llm.batch_size", len(texts)))...)
+	defer span.End()
+
 	var vectors [][]float32
 	err := g.runWithGuard(ctx, desc, func(p Provider) error {
 		var e error
 		vectors, e = p.Embed(ctx, desc, texts)
 		return e
 	})
+	observability.MarkError(span, err)
 	return vectors, err
 }
 
 // Rerank 重排序。
 func (g *Gateway) Rerank(ctx context.Context, desc *ModelDescriptor, query string, docs []string, topN int) ([]RerankResult, error) {
+	ctx, span := observability.StartSpan(ctx, "llm.rerank",
+		append(llmAttrs(desc), attribute.Int("llm.candidate_count", len(docs)))...)
+	defer span.End()
+
 	var results []RerankResult
 	err := g.runWithGuard(ctx, desc, func(p Provider) error {
 		var e error
 		results, e = p.Rerank(ctx, desc, query, docs, topN)
 		return e
 	})
+	observability.MarkError(span, err)
 	return results, err
 }
 
@@ -184,3 +235,24 @@ func (g *Gateway) recordUsage(model string, u Usage) {
 
 // ErrCircuitOpen 熔断打开错误。
 var ErrCircuitOpen = fmt.Errorf("provider circuit open")
+
+// llmAttrs 模型维度 span 属性（与 llm_tokens_total 的 model 标签口径保持一致）。
+func llmAttrs(desc *ModelDescriptor) []attribute.KeyValue {
+	if desc == nil {
+		return nil
+	}
+	return []attribute.KeyValue{
+		attribute.String("llm.model", desc.ModelName),
+		attribute.String("llm.provider", desc.ProviderCode),
+	}
+}
+
+// usageAttrs Token 用量 span 属性（与 llm_tokens_total 指标同源）。
+// 注意流式路径拿不到：usage 在流的最后一帧里，由调用方消费，
+// 网关层看不到（课堂讨论点：要不要把 span 交给流消费方补属性）。
+func usageAttrs(u Usage) []attribute.KeyValue {
+	return []attribute.KeyValue{
+		attribute.Int("llm.tokens.prompt", u.PromptTokens),
+		attribute.Int("llm.tokens.completion", u.CompletionTokens),
+	}
+}

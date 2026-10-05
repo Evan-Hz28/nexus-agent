@@ -34,8 +34,8 @@ import (
 	"github.com/chengpeng-cp/nexus-agent/internal/service"
 	"github.com/chengpeng-cp/nexus-agent/internal/tool"
 	"github.com/chengpeng-cp/nexus-agent/internal/vector"
-	"github.com/chengpeng-cp/nexus-agent/internal/workflow"
 	"github.com/chengpeng-cp/nexus-agent/internal/worker"
+	"github.com/chengpeng-cp/nexus-agent/internal/workflow"
 )
 
 func main() {
@@ -164,7 +164,8 @@ func run() error {
 		server.WithIdleTimeout(120*time.Second),
 	)
 	root := h.Group("/")
-	root.Use(api.Recovery(), api.CORS(), api.AccessLog())
+	// Tracing 放最外层：根 span 覆盖整条中间件链与 handler
+	root.Use(api.Tracing(), api.Recovery(), api.CORS(), api.AccessLog())
 	root.GET("/healthz", api.Healthz())
 	root.GET("/metrics", api.Metrics())
 	api.Register(root, api.New(svcs), jwtMgr)

@@ -188,12 +188,12 @@ func (e *Engine) DeleteDocument(ctx context.Context, collection string, docID in
 
 // Ref 检索引用（前端展示"参考来源"）。
 type Ref struct {
-	ChunkID   int64  `json:"chunk_id"`
-	DocumentID int64 `json:"document_id"`
-	Filename  string `json:"filename"`
-	Page      int    `json:"page"`
-	Content   string `json:"content"`
-	Score     float32 `json:"score"`
+	ChunkID    int64   `json:"chunk_id"`
+	DocumentID int64   `json:"document_id"`
+	Filename   string  `json:"filename"`
+	Page       int     `json:"page"`
+	Content    string  `json:"content"`
+	Score      float32 `json:"score"`
 }
 
 // Retrieve 混合检索主流程：稠密 + 关键词 → RRF → (Rerank) → 截断。
@@ -225,24 +225,13 @@ func (e *Engine) Retrieve(ctx context.Context, kb *model.KnowledgeBase, query st
 	fused := Fuse(denseHits, kwHits, e.cfg.RRFK, int(e.cfg.FusedTopN))
 	observeStage("fused", start)
 
-	// ④ Rerank（可选：取值函数返回 nil 描述符时跳过）
-	var final []FusedChunk
-	if rerankMdl := e.rerankMdl(); rerankMdl != nil && len(fused) > 0 {
-		start = recordStart()
-		final, err = e.rerank(ctx, fused, query)
-		observeStage("rerank", start)
-		if err != nil {
-			// rerank 失败降级用融合序
-			final = fused
-		}
-	} else {
-		final = fused
-	}
-
-	// ⑤ 分数阈值过滤 + 截断
-	// 稠密路只从 Milvus 拿到 chunk id（向量库不存正文），命中项需回 PG 补 content
-	needLookup := make([]int64, 0, len(final))
-	for _, f := range final {
+	// ④ 回表补正文（必须早于 rerank）
+	// 稠密路只从 Milvus 拿到 chunk id（向量库不存正文），命中项需回 PG 补 content；
+	// 关键词路的项本身来自 PG 已带正文，故只对 content 为空的项按 ID 批量回查，避免无谓 IO。
+	// 顺序约束：rerank 是把正文送进精排模型打分的，必须在回表之后执行 ——
+	// 若颠倒，稠密路命中的候选会以空文档参与打分而被误判为不相关。
+	needLookup := make([]int64, 0, len(fused))
+	for _, f := range fused {
 		if f.Chunk.Content == "" {
 			needLookup = append(needLookup, f.Chunk.ID)
 		}
@@ -253,18 +242,39 @@ func (e *Engine) Retrieve(ctx context.Context, kb *model.KnowledgeBase, query st
 			for _, ch := range found {
 				byID[ch.ID] = ch
 			}
-			for i := range final {
-				if ch, ok := byID[final[i].Chunk.ID]; ok {
-					final[i].Chunk = ch // 回填正文/文档归属
+			for i := range fused {
+				if ch, ok := byID[fused[i].Chunk.ID]; ok {
+					fused[i].Chunk = ch // 回填正文/文档归属
 				}
 			}
 		}
 		// 回查失败不阻塞检索：content 为空的引用前端按"仅命中"展示
 	}
 
+	// ⑤ Rerank（可选：取值函数返回 nil 描述符时跳过）
+	var final []FusedChunk
+	reranked := false
+	if rerankMdl := e.rerankMdl(); rerankMdl != nil && len(fused) > 0 {
+		start = recordStart()
+		final, err = e.rerank(ctx, fused, query)
+		observeStage("rerank", start)
+		if err != nil {
+			// rerank 失败降级用融合序
+			final = fused
+		} else {
+			reranked = true // 分数已替换为 rerank 相关性分（0~1 量纲）
+		}
+	} else {
+		final = fused
+	}
+
+	// ⑥ 分数阈值过滤 + 截断
+	// ScoreThreshold 按 rerank 相关性分量纲标定（0~1）；未 rerank 时 f.Score 是 RRF 融合分，
+	// 量级仅 1/(k+rank) ≈ 0.01~0.03，两者不可比 —— 故阈值只在 rerank 生效时应用，
+	// 否则一律按 FinalTopK 截断（否则高阈值会误杀全部结果，实际只返回前 3 条）。
 	refs := make([]Ref, 0, len(final))
 	for _, f := range final {
-		if e.cfg.ScoreThreshold > 0 && f.Score < e.cfg.ScoreThreshold && len(refs) >= 3 {
+		if reranked && e.cfg.ScoreThreshold > 0 && f.Score < e.cfg.ScoreThreshold && len(refs) >= 3 {
 			// 前三条即使低分也保留（避免空引用），之后按阈值过滤
 			break
 		}

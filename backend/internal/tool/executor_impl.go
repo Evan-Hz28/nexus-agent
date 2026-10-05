@@ -15,8 +15,12 @@ import (
 	"fmt"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+
 	"github.com/chengpeng-cp/nexus-agent/internal/llm"
 	"github.com/chengpeng-cp/nexus-agent/internal/model"
+	"github.com/chengpeng-cp/nexus-agent/internal/observability"
 	"github.com/chengpeng-cp/nexus-agent/internal/pkg/errcode"
 )
 
@@ -100,8 +104,23 @@ func (e *ProdExecutor) List(agentToolsJSON string) ([]llm.ToolDef, error) {
 
 // Invoke 执行一次工具调用。
 func (e *ProdExecutor) Invoke(ctx context.Context, agentToolsJSON, name, argsJSON string) ToolResult {
+	ctx, span := observability.StartSpan(ctx, "tool."+name, attribute.String("tool.name", name))
+
 	start := time.Now()
 	res := ToolResult{ToolName: name}
+
+	// span 收尾放在最前面注册（defer 后进先出，它会最后执行）：
+	// 这样无论正常返回、提前返回还是 panic 兜底，都能带上最终状态和耗时。
+	defer func() {
+		span.SetAttributes(
+			attribute.String("tool.status", res.Status),
+			attribute.Int64("tool.elapsed_ms", res.Elapsed),
+		)
+		if res.Status != "" && res.Status != "ok" {
+			span.SetStatus(codes.Error, res.Status)
+		}
+		span.End()
+	}()
 
 	// ① 超时控制：默认 30s，工具定义可覆盖
 	timeout := e.cfg.DefaultTimeout

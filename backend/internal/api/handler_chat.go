@@ -56,8 +56,16 @@ func (h *Handler) Chat(ctx context.Context, c *app.RequestContext) {
 	c.Response.Header.Set("X-Accel-Buffering", "no") // Nginx 不缓冲
 	c.Response.SetBodyStream(pr, -1)
 
+	// SSE 是长连接：handler 在这里就返回了，但事件流还要写很久。
+	// 所以从 Tracing 中间件手里接管根 span，等流真正写完再结束它，
+	// 否则 Jaeger 里会看到"根 span 只有几毫秒、子 span 却好几秒"。
+	streamSpan := TakeRootSpan(c)
+
 	go func() {
 		defer pw.Close()
+		if streamSpan != nil {
+			defer streamSpan.End()
+		}
 		for ev := range events {
 			data, err := json.Marshal(ev.Data)
 			if err != nil {
