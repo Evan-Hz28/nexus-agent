@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	_ "net/http/pprof" // Ep18 演示：导入即把 pprof handler 注册到 DefaultServeMux
 	"os"
 	"os/signal"
 	"syscall"
@@ -169,6 +170,12 @@ func run() error {
 	root.GET("/healthz", api.Healthz())
 	root.GET("/metrics", api.Metrics())
 	api.Register(root, api.New(svcs), jwtMgr)
+
+	// ===== ⑫' pprof 诊断端口（Ep18 演示）：单独监听 6060，与业务 8080 完全隔离 =====
+	// 生产环境此端口绝不能对外暴露。用法：
+	//   go tool pprof -http :8090 "http://localhost:6060/debug/pprof/profile?seconds=15"
+	//   curl -s "http://localhost:6060/debug/pprof/goroutine?debug=1" | head -3
+	go func() { _ = http.ListenAndServe("localhost:6060", nil) }()
 
 	// ===== ⑬ A2A 对外端点（独立 net/http 端口，回调标准对话链路） =====
 	if cfg.A2A.Enabled {
